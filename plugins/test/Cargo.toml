@@ -1,0 +1,17 @@
+[package]
+name = "test-plugin"
+version = "0.1.0"
+authors = ["Guillaume Depardon <guillaume.depardon@gmail.com>"]
+build = "build.rs"
+
+[dependencies]
+capnp = "0.8"
+capnp-rpc = "0.8"
+
+futures = "0.1"
+tokio = "0.1"
+
+rand = "0.5"
+
+[build-dependencies]
+capnpc = "0.8"
