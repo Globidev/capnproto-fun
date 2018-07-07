@@ -10,6 +10,17 @@ capnp-rpc = "0.8"
 
 futures = "0.1"
 tokio = "0.1"
+tokio-tls = "0.1"
+
+tokio-tungstenite = { git = "https://github.com/snapview/tokio-tungstenite" }
+tungstenite = "0.5"
+
+url = "1.7"
+
+serde = "1.0"
+serde_json = "1.0"
+serde_derive = "1.0"
+serde-value = "0.5"
 
 [build-dependencies]
 capnpc = "0.8"
