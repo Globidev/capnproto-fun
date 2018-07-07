@@ -1,85 +1,64 @@
-extern crate capnp;
-extern crate capnp_rpc;
+#[macro_use]
+extern crate serde_derive;
+
 extern crate futures;
 extern crate tokio;
 
-use capnp::capability::Promise;
-use capnp_rpc::{twoparty, rpc_twoparty_capnp, RpcSystem};
-
 use futures::prelude::*;
-use tokio::prelude::*;
 
-use tokio::executor::current_thread;
-use tokio::runtime::current_thread::Runtime;
+mod gateway;
 
-mod protocol_capnp {
-    include!(concat!(env!("OUT_DIR"), "/protocol_capnp.rs"));
-}
+use std::time::{Instant, Duration};
 
-use protocol_capnp::rpc;
+use std::sync::{Arc, RwLock};
 
 pub fn main() {
-    let host_addr = std::env::args()
-        .nth(1).expect("Missing host address")
-        .parse().expect("Invalid host address");
+    // let sequence_number = Arc::new(RwLock::new(None));
 
-    let mut runtime = Runtime::new()
-        .expect("Failed to initialize tokio runtime");
+    // let work = gateway::connect()
+    //     .map_err(|e| println!("{:?}", e))
+    //     .and_then(move |(events, mut sink)| {
+    //         events.for_each(move |e| {
+    //             println!("IN: {:?}", e);
 
-    let listener = tokio::net::TcpListener::bind(&host_addr)
-        .expect("Failed to bind listener");
+    //             match e {
+    //                 gateway::event::EventIn::Dispatch(d) => {
+    //                     *sequence_number.write().unwrap() = Some(d.sequence_number);
+    //                 },
 
-    let work = listener.incoming()
-        .for_each(move |stream| {
-            let rpc_system = match stream.split() {
-                (reader, writer) => make_rpc_system(reader, writer)
-            };
+    //                 gateway::event::EventIn::Hello(h) => {
+    //                     sink.identify();
 
-            current_thread::spawn(rpc_system
-                .map_err(|e| panic!("Failed to spawn rpc system: {}", e))
-            );
+    //                     let mut hb_sink = sink.clone();
+    //                     let n = Arc::clone(&sequence_number);
+    //                     let send_heartbeats = tokio::timer::Interval::new(
+    //                         Instant::now() + Duration::from_millis(h.heartbeat_interval), Duration::from_millis(h.heartbeat_interval)
+    //                     )
+    //                     .for_each(move |_| {
+    //                         hb_sink.heartbeat(*n.read().unwrap());
+    //                         Ok(())
+    //                     })
+    //                     .map_err(|e| println!("{}", e));
 
-            Ok(())
+    //                     tokio::spawn(send_heartbeats);
+    //                 },
+
+    //                 _ => {}
+    //             }
+
+    //             Ok(())
+    //         }).map_err(|e| println!("{:?}", e))
+    //     });
+
+    let work = gateway::connect()
+        .map_err(|e| println!("{:?}", e))
+        .and_then(|(events, mut sink)| {
+            events.for_each(|e| {
+                println!("{:?}", e);
+                Ok(())
+            }).map_err(|e| println!("{}", e))
         });
 
-    runtime.block_on(work)
-        .expect("failed to run work");
+    tokio::run(work);
 }
 
-struct ServerState { }
-
-fn make_rpc_system<R, W>(reader: R, writer: W)
-    -> RpcSystem<rpc_twoparty_capnp::Side>
-where
-    R: Read + 'static,
-    W: Write + 'static
-{
-    let network = twoparty::VatNetwork::new(
-        reader, writer,
-        rpc_twoparty_capnp::Side::Server,
-        Default::default()
-    );
-
-    let proxy = rpc::ToClient::new(ServerState { }).
-        from_server::<::capnp_rpc::Server>();
-
-    RpcSystem::new(Box::new(network), Some(proxy.client))
-}
-
-impl rpc::Server for ServerState {
-    fn add(&mut self, params: rpc::AddParams, mut results: rpc::AddResults)
-        -> Promise<(), ::capnp::Error>
-    {
-        params.get()
-            .map(|add_params| {
-                let result = {
-                    let a = add_params.get_a() as i64;
-                    let b = add_params.get_b() as i64;
-                    a + b
-                };
-                results.get().set_result(result);
-                Promise::ok(())
-            })
-            .unwrap_or_else(|e| Promise::err(e))
-    }
-}
