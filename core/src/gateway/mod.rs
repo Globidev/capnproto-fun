@@ -6,6 +6,7 @@ extern crate tokio;
 extern crate tokio_tls;
 
 use self::futures::prelude::*;
+use self::futures::future;
 use self::futures::stream::{SplitStream, SplitSink};
 use self::futures::sync::mpsc;
 
@@ -22,6 +23,10 @@ use self::tungstenite::{
     Error as WsError
 };
 
+use std::sync::{Arc, RwLock};
+
+use std::time::{Duration, Instant};
+
 pub mod event;
 
 use self::event::{Event, MessageIn, MessageOut};
@@ -33,92 +38,205 @@ type WsStream = WebSocketStream<StreamSwitcher<TcpStream, TlsStream<TcpStream>>>
 pub type EventStream = mpsc::Receiver<Event>;
 type EventSink = mpsc::Sender<Event>;
 
+type BoxFuture<T, E> = Box<Future<Item = T, Error = E> + Send + 'static>;
+
 struct Gateway {
     stream: SplitStream<WsStream>,
     sink: SplitSink<WsStream>,
     event_sink: EventSink,
+    action_stream: mpsc::Receiver<MessageOut>,
     action_sink: InternalActionSink,
 }
 
 struct InternalActionSink {
-    tx: mpsc::Sender<MessageOut>
+    tx: mpsc::Sender<MessageOut>,
+    sequence_number: Arc<RwLock<Option<u32>>>,
+}
+
+impl InternalActionSink {
+    fn send_heartbeat(self, sequence_number: u32)
+        -> impl Future<Item = Self, Error = ()>
+    {
+        let heartbeat_event = MessageOut::Heartbeat(Some(sequence_number));
+        let atomic_sequence_number = Arc::clone(&self.sequence_number);
+        self.tx.send(heartbeat_event)
+            .map(|tx| Self { tx, sequence_number: atomic_sequence_number })
+            .map_err(|e| println!("Failed to queue heartbeat: {}", e))
+    }
+
+    fn send_heartbeats(&self, interval: Duration)
+        -> impl Future<Item = (), Error = ()>
+    {
+        let heartbeats_tx = self.tx.clone();
+        let atomic_sequence_number = Arc::clone(&self.sequence_number);
+
+        self::tokio::timer::Interval::new(Instant::now() + interval, interval)
+            .map_err(|e| println!("Heartbeat timer error: {}", e))
+            .fold(heartbeats_tx, move |tx, _| {
+                let sequence_number = atomic_sequence_number.read().unwrap();
+                let heartbeat_event = MessageOut::Heartbeat(*sequence_number);
+                tx.send(heartbeat_event)
+                    .map_err(|e| println!("Failed to queue heartbeat: {}", e))
+            })
+            .map(|_tx| ())
+    }
+
+    fn identify(self) -> impl Future<Item = Self, Error = ()> {
+        let token = String::from("NDY0MjM5NzA5NzQ1NTc3OTg1.Dh8EwA.viWCf4SN6rDNrzAP1ONF50NQCmw");
+        let properties = event::op::IdentifyProperties {
+            os: String::from("linux"),
+            browser: String::from("none"),
+            device: String::from("globiworkstation")
+        };
+
+        let identify_data = event::op::Identify { token, properties, ..Default::default() };
+        let identify_event = MessageOut::Identify(identify_data);
+
+        match self {
+            Self { tx, sequence_number } => {
+                tx.send(identify_event)
+                    .map_err(|e| println!("Failed to queue identify: {}", e))
+                    .map(|tx| Self { tx, sequence_number: sequence_number })
+            }
+        }
+    }
+
+    fn update_sequence_number(&mut self, new_sequence_number: u32) {
+        *self.sequence_number.write().unwrap() = Some(new_sequence_number);
+    }
 }
 
 pub struct ActionSink {
     tx: mpsc::Sender<MessageOut>
 }
 
-// impl WsSink {
-//     fn new(sink: SplitSink<WsStream>) -> Self {
-//         let (tx, rx) = mpsc::channel(0);
-//         self::tokio::executor::spawn(send_messages(sink, rx));
+struct GatewayState {
+    action_sink: InternalActionSink,
+    event_sink: EventSink,
+}
 
-//         Self { tx }
-//     }
-
-//     pub fn identify(&mut self) {
-//         let token = String::from("NDY0MjM5NzA5NzQ1NTc3OTg1.Dh8EwA.viWCf4SN6rDNrzAP1ONF50NQCmw");
-//         let properties = event::op::IdentifyProperties {
-//             os: String::from("linux"),
-//             browser: String::from("none"),
-//             device: String::from("globiworkstation")
-//         };
-
-//         let identify_data = event::op::Identify { token, properties, ..Default::default() };
-//         let identify_event = event::MessageOut::Identify(identify_data);
-
-//         self.tx.try_send(identify_event)
-//             .expect("error queuing identify")
-//     }
-
-//     pub fn heartbeat(&mut self, sequence_number: Option<u32>) {
-//         let heartbeat_event = MessageOut::Heartbeat(sequence_number);
-
-//         self.tx.try_send(heartbeat_event)
-//             .expect("error queuing heartbeat")
-//     }
-// }
-
-fn send_messages(sink: SplitSink<WsStream>, rx: mpsc::Receiver<MessageOut>)
-    -> impl Future<Item = (), Error = ()>
+fn process_message(state: GatewayState, message: MessageIn)
+    -> impl Future<Item = GatewayState, Error = ()>
 {
-    rx.fold(sink, |sink, event| {
-        let payload = event::to_raw_payload(event).unwrap();
-        println!("OUT: {:?}", payload);
-        sink.send(WsMessage::Text(payload))
-            .map_err(|e| println!("{:?}", e))
-    }).map(|_sink| ())
+    use self::MessageIn::*;
+
+    match message {
+        Dispatch(seq, event) => match state {
+            GatewayState { mut action_sink, event_sink } => {
+                action_sink.update_sequence_number(seq);
+                let state_after_queue = event_sink.send(event)
+                    .map(|event_sink| GatewayState {
+                        action_sink,
+                        event_sink
+                    })
+                    .map_err(|e| println!("Error queuing event: {}", e));
+                Box::new(state_after_queue) as BoxFuture<_, _>
+            }
+        },
+        HeartBeat(seq) => match state {
+            GatewayState { action_sink, event_sink } => {
+                let state_after_queue = action_sink.send_heartbeat(seq)
+                    .map(|action_sink| GatewayState {
+                        action_sink,
+                        event_sink
+                    });
+                Box::new(state_after_queue)
+            }
+        },
+        Reconnect => {
+            Box::new(future::ok(state))
+        },
+        InvalidSession => {
+            Box::new(future::ok(state))
+        },
+        Hello(hello) => match state {
+            GatewayState { action_sink, event_sink } => {
+                let interval = Duration::from_millis(hello.heartbeat_interval);
+                let heartbeats = action_sink.send_heartbeats(interval);
+                self::tokio::spawn(heartbeats);
+
+                let state_after_queue = action_sink.identify()
+                    .map(|action_sink| GatewayState {
+                        action_sink,
+                        event_sink
+                    });
+
+                Box::new(state_after_queue)
+            }
+        },
+        HeartbeatAck => {
+            Box::new(future::ok(state))
+        },
+    }
 }
 
 fn run_gateway(gateway: Gateway) -> impl Future<Item = (), Error = ()> {
+    let state = GatewayState {
+        action_sink: gateway.action_sink,
+        event_sink: gateway.event_sink
+    };
 
+    let process_messages = gateway.stream
+        .map_err(|e| println!("Event input error: {:?}", e))
+        .filter_map(text_data)
+        .fold(state, move |state, payload| {
+            println!("<< {:?}", payload);
+
+            let message = event::from_raw_payload(&payload)
+                .expect("invalid input payload");
+
+            process_message(state, message)
+        })
+        .map(|_| ());
+
+    let process_actions = gateway.action_stream
+        .fold(gateway.sink, |sink, message| {
+            println!(">> {:?}", message);
+
+            let payload = event::to_raw_payload(message)
+                .expect("invalid output payload");
+
+            sink.send(WsMessage::Text(payload))
+                .map_err(|e| println!("Failed to send message {:?}", e))
+        })
+        .map(|_sink| ());
+
+    process_messages
+        .join(process_actions)
+        .map(|_| ())
 }
 
-pub fn connect() -> impl Future<Item = (EventStream, ActionSink), Error = WsError> {
+pub fn connect()
+    -> impl Future<Item = (EventStream, ActionSink), Error = WsError>
+{
     use self::tungstenite::handshake::client::Request;
     use self::url::Url;
 
     const WS_URL: &'static str = "wss://gateway.discord.gg/?v=6&encoding=json";
 
-    let url = Url::parse(WS_URL).expect("Invalid Gateway URL");
-    // let req:  = url.into();
-    self::tokio_tungstenite::connect_async(url.into())
+    let url = Url::parse(WS_URL)
+        .expect("Invalid Gateway URL");
+
+    self::tokio_tungstenite::connect_async(Request::from(url))
         .map(|(ws_stream, _response)| {
             let (sink, stream) = ws_stream.split();
-            let (event_sink, event_stream) = mpsc::channel(0);
-            let gateway = Gateway { stream, sink, event_sink };
+
+            let (event_tx, event_rx) = mpsc::channel(0);
+            let (action_tx, action_rx) = mpsc::channel(0);
+
+            let gateway = Gateway {
+                stream, sink,
+                event_sink: event_tx,
+                action_stream: action_rx,
+                action_sink: InternalActionSink {
+                    tx: action_tx.clone(),
+                    sequence_number: Default::default()
+                },
+            };
 
             self::tokio::spawn(run_gateway(gateway));
 
-            let events = stream
-                .filter_map(text_data) // Keep only text messages
-                .filter_map(|raw_data| {
-                    event::from_raw_payload(&raw_data)
-                        .map_err(|err| println!("{:?}", err))
-                        .ok()
-                });
-
-            (event_stream, WsSink::new(sink))
+            (event_rx, ActionSink { tx: action_tx })
         })
 }
 
