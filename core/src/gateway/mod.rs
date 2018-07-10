@@ -35,7 +35,9 @@ use self::event::{Event, MessageIn, MessageOut};
 
 type WsStream = WebSocketStream<StreamSwitcher<TcpStream, TlsStream<TcpStream>>>;
 
-pub type EventStream = mpsc::Receiver<Event>;
+#[allow(dead_code)] // BUG: https://github.com/rust-lang/rust/issues/18290
+type EventStream = mpsc::Receiver<Event>;
+
 type EventSink = mpsc::Sender<Event>;
 
 type BoxFuture<T, E> = Box<Future<Item = T, Error = E> + Send + 'static>;
@@ -57,11 +59,9 @@ impl InternalActionSink {
     fn send_heartbeat(self, sequence_number: u32)
         -> impl Future<Item = Self, Error = ()>
     {
-        let heartbeat_event = MessageOut::Heartbeat(Some(sequence_number));
-        let atomic_sequence_number = Arc::clone(&self.sequence_number);
-        self.tx.send(heartbeat_event)
-            .map(|tx| Self { tx, sequence_number: atomic_sequence_number })
-            .map_err(|e| println!("Failed to queue heartbeat: {}", e))
+        let heartbeat_message = MessageOut::Heartbeat(Some(sequence_number));
+
+        self.send(heartbeat_message)
     }
 
     fn send_heartbeats(&self, interval: Duration)
@@ -74,8 +74,8 @@ impl InternalActionSink {
             .map_err(|e| println!("Heartbeat timer error: {}", e))
             .fold(heartbeats_tx, move |tx, _| {
                 let sequence_number = atomic_sequence_number.read().unwrap();
-                let heartbeat_event = MessageOut::Heartbeat(*sequence_number);
-                tx.send(heartbeat_event)
+                let heartbeat_message = MessageOut::Heartbeat(*sequence_number);
+                tx.send(heartbeat_message)
                     .map_err(|e| println!("Failed to queue heartbeat: {}", e))
             })
             .map(|_tx| ())
@@ -90,19 +90,21 @@ impl InternalActionSink {
         };
 
         let identify_data = event::op::Identify { token, properties, ..Default::default() };
-        let identify_event = MessageOut::Identify(identify_data);
+        let identify_message = MessageOut::Identify(identify_data);
 
-        match self {
-            Self { tx, sequence_number } => {
-                tx.send(identify_event)
-                    .map_err(|e| println!("Failed to queue identify: {}", e))
-                    .map(|tx| Self { tx, sequence_number: sequence_number })
-            }
-        }
+        self.send(identify_message)
     }
 
     fn update_sequence_number(&mut self, new_sequence_number: u32) {
         *self.sequence_number.write().unwrap() = Some(new_sequence_number);
+    }
+
+    fn send(self, message: MessageOut) -> impl Future<Item = Self, Error = ()> {
+        let Self { tx, sequence_number } = self;
+
+        tx.send(message)
+            .map_err(|e| println!("Failed to queue Message: {}", e))
+            .map(|tx| Self { tx, sequence_number })
     }
 }
 
