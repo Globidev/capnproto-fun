@@ -6,12 +6,12 @@ extern crate tokio;
 
 use futures::prelude::*;
 
-mod gateway;
+mod discord;
 
 pub fn main() {
-    let work = gateway::connect()
+    let work = discord::gateway::connect()
         .map_err(|e| println!("{:?}", e))
-        .and_then(|(events, mut sink)| {
+        .and_then(|(events, _sink)| {
             events.for_each(|e| {
                 println!("{:?}", e);
                 Ok(())

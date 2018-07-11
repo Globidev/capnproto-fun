@@ -28,8 +28,12 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 pub mod event;
+mod protocol;
+mod codec;
 
-use self::event::{Event, MessageIn, MessageOut};
+use self::event::Event;
+use self::protocol::{MessageIn, MessageOut};
+use super::types::{SequenceNumber};
 
 // const BASE_URL: &'static str = "https://discordapp.com/api";
 
@@ -52,29 +56,21 @@ struct Gateway {
 
 struct InternalActionSink {
     tx: mpsc::Sender<MessageOut>,
-    sequence_number: Arc<RwLock<Option<u32>>>,
+    seq: Arc<RwLock<Option<SequenceNumber>>>,
 }
 
 impl InternalActionSink {
-    fn send_heartbeat(self, sequence_number: u32)
-        -> impl Future<Item = Self, Error = ()>
-    {
-        let heartbeat_message = MessageOut::Heartbeat(Some(sequence_number));
-
-        self.send(heartbeat_message)
-    }
-
     fn send_heartbeats(&self, interval: Duration)
         -> impl Future<Item = (), Error = ()>
     {
         let heartbeats_tx = self.tx.clone();
-        let atomic_sequence_number = Arc::clone(&self.sequence_number);
+        let atomic_seq = Arc::clone(&self.seq);
 
         self::tokio::timer::Interval::new(Instant::now() + interval, interval)
             .map_err(|e| println!("Heartbeat timer error: {}", e))
             .fold(heartbeats_tx, move |tx, _| {
-                let sequence_number = atomic_sequence_number.read().unwrap();
-                let heartbeat_message = MessageOut::Heartbeat(*sequence_number);
+                let seq = atomic_seq.read().unwrap();
+                let heartbeat_message = MessageOut::Heartbeat(*seq);
                 tx.send(heartbeat_message)
                     .map_err(|e| println!("Failed to queue heartbeat: {}", e))
             })
@@ -83,28 +79,28 @@ impl InternalActionSink {
 
     fn identify(self) -> impl Future<Item = Self, Error = ()> {
         let token = String::from("NDY0MjM5NzA5NzQ1NTc3OTg1.Dh8EwA.viWCf4SN6rDNrzAP1ONF50NQCmw");
-        let properties = event::op::IdentifyProperties {
+        let properties = protocol::IdentifyProperties {
             os: String::from("linux"),
             browser: String::from("none"),
             device: String::from("globiworkstation")
         };
 
-        let identify_data = event::op::Identify { token, properties, ..Default::default() };
+        let identify_data = protocol::Identify { token, properties, ..Default::default() };
         let identify_message = MessageOut::Identify(identify_data);
 
         self.send(identify_message)
     }
 
-    fn update_sequence_number(&mut self, new_sequence_number: u32) {
-        *self.sequence_number.write().unwrap() = Some(new_sequence_number);
+    fn update_sequence_number(&mut self, new_seq: SequenceNumber) {
+        *self.seq.write().unwrap() = Some(new_seq);
     }
 
     fn send(self, message: MessageOut) -> impl Future<Item = Self, Error = ()> {
-        let Self { tx, sequence_number } = self;
+        let Self { tx, seq } = self;
 
         tx.send(message)
             .map_err(|e| println!("Failed to queue Message: {}", e))
-            .map(|tx| Self { tx, sequence_number })
+            .map(|tx| Self { tx, seq })
     }
 }
 
@@ -137,7 +133,8 @@ fn process_message(state: GatewayState, message: MessageIn)
         },
         HeartBeat(seq) => match state {
             GatewayState { action_sink, event_sink } => {
-                let state_after_queue = action_sink.send_heartbeat(seq)
+                let heartbeat_message = MessageOut::Heartbeat(Some(seq));
+                let state_after_queue = action_sink.send(heartbeat_message)
                     .map(|action_sink| GatewayState {
                         action_sink,
                         event_sink
@@ -172,7 +169,10 @@ fn process_message(state: GatewayState, message: MessageIn)
     }
 }
 
+
 fn run_gateway(gateway: Gateway) -> impl Future<Item = (), Error = ()> {
+    use self::codec::Codec;
+
     let state = GatewayState {
         action_sink: gateway.action_sink,
         event_sink: gateway.event_sink
@@ -181,10 +181,10 @@ fn run_gateway(gateway: Gateway) -> impl Future<Item = (), Error = ()> {
     let process_messages = gateway.stream
         .map_err(|e| println!("Event input error: {:?}", e))
         .filter_map(text_data)
-        .fold(state, move |state, payload| {
-            println!("<< {:?}", payload);
+        .fold(state, move |state, raw_payload| {
+            println!("<< {:?}", raw_payload);
 
-            let message = event::from_raw_payload(&payload)
+            let message = codec::JSONCodec::decode(raw_payload)
                 .expect("invalid input payload");
 
             process_message(state, message)
@@ -195,7 +195,7 @@ fn run_gateway(gateway: Gateway) -> impl Future<Item = (), Error = ()> {
         .fold(gateway.sink, |sink, message| {
             println!(">> {:?}", message);
 
-            let payload = event::to_raw_payload(message)
+            let payload = codec::JSONCodec::encode(message)
                 .expect("invalid output payload");
 
             sink.send(WsMessage::Text(payload))
@@ -232,7 +232,7 @@ pub fn connect()
                 action_stream: action_rx,
                 action_sink: InternalActionSink {
                     tx: action_tx.clone(),
-                    sequence_number: Default::default()
+                    seq: Default::default()
                 },
             };
 
